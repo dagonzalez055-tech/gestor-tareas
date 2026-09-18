@@ -5,7 +5,6 @@ import os
 import time
 from datetime import datetime, timedelta
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from supabase import create_client
@@ -22,20 +21,11 @@ st.set_page_config(
 )
 
 MINUTOS_ALERTA = 15
+BUCKET_ADJUNTOS = "adjuntos"
 
 # ==========================================
 # PWA: hacer la app instalable (icono en pantalla de inicio)
 # ==========================================
-# Requiere: .streamlit/config.toml con enableStaticServing = true, y los
-# archivos static/manifest.json, static/icon-192.png, static/icon-512.png
-# y static/service-worker.js incluidos en el repositorio.
-#
-# Nota: en Streamlit Community Cloud hay un problema conocido de la
-# plataforma por el cual, al instalar la app, el nombre y el icono que
-# aparecen en la pantalla de inicio a veces siguen mostrando "Streamlit"
-# en vez de los propios, aunque el manifest este bien cargado (bug
-# reportado por varios usuarios, sin resolver hasta la fecha). El boton
-# de instalar y el modo "app sin barra del navegador" igual funcionan.
 st.components.v1.html(
     """
     <script>
@@ -100,25 +90,19 @@ supabase = init_supabase()
 
 # Refresca el script solo (sin recargar la pagina) cada 20 segundos, para
 # que las alertas de "faltan 15 minutos" se disparen aunque no estes
-# tocando nada en pantalla.
+# tocando nada en pantalla. OJO: esto solo funciona mientras la pestaña
+# esta ABIERTA Y EN PRIMER PLANO — si el celular se bloquea o cambiás de
+# app, el navegador pausa estos temporizadores (limitación del navegador,
+# no de la app). Ver mas detalle en la respuesta del chat.
 st_autorefresh(interval=20_000, limit=None, key="autorefresh_alertas")
 
 # ==========================================
 # TRANSCRIPCIÓN DE VOZ A TEXTO
 # ==========================================
-IDIOMA_RECONOCIMIENTO = "es-AR"  # cambialo a "es-ES", "es-MX", etc. si preferís
+IDIOMA_RECONOCIMIENTO = "es-AR"
 
 
 def transcribir_audio(audio_bytes: bytes, idioma: str = IDIOMA_RECONOCIMIENTO):
-    """
-    Convierte el audio grabado (WAV, tal como lo entrega st.audio_input)
-    a texto usando el reconocedor gratuito de Google (requiere internet,
-    no necesita API key).
-
-    Devuelve una tupla (texto, error). Si la transcripción fue exitosa,
-    'error' es None. Si falló, 'texto' es None y 'error' trae el motivo
-    para mostrarlo al usuario.
-    """
     reconocedor = sr.Recognizer()
     try:
         with sr.AudioFile(io.BytesIO(audio_bytes)) as fuente:
@@ -137,8 +121,16 @@ def transcribir_audio(audio_bytes: bytes, idioma: str = IDIOMA_RECONOCIMIENTO):
 
 
 # ==========================================
-# FUNCIONES DE BASE DE DATOS
+# FUNCIONES DE BASE DE DATOS — TAREAS
 # ==========================================
+def _normalizar_columnas_tareas(df):
+    """Por si la migración de proyecto_id/adjuntos todavía no se corrió:
+    evita que la app se rompa, simplemente esas funciones no van a tener
+    efecto hasta que corras el SQL correspondiente."""
+    for col in ("proyecto_id", "adjunto_path", "adjunto_nombre"):
+        if col not in df.columns:
+            df[col] = None
+    return df
 
 
 def cargar_tareas():
@@ -150,15 +142,14 @@ def cargar_tareas():
             .order("hora", desc=False)
             .execute()
         )
-        return pd.DataFrame(res.data)
+        df = pd.DataFrame(res.data)
+        return _normalizar_columnas_tareas(df)
     except Exception as e:
         st.error(f"Error al cargar tareas: {e}")
         return pd.DataFrame()
 
 
-def agregar_tarea(titulo, categoria, responsable, fecha, hora, notas):
-    """Toda tarea nueva arranca en 0% / Pendiente. Se clasifica sola como
-    'Agendada' en el resumen si la fecha/hora quedó en el futuro."""
+def agregar_tarea(titulo, categoria, responsable, fecha, hora, notas, proyecto_id=None):
     data = {
         "titulo": titulo,
         "categoria": categoria,
@@ -169,16 +160,12 @@ def agregar_tarea(titulo, categoria, responsable, fecha, hora, notas):
         "avance": 0,
         "notas": notas,
         "alertado": False,
+        "proyecto_id": proyecto_id,
     }
     supabase.from_("tareas").insert(data).execute()
 
 
-def actualizar_tarea_completa(id_tarea, avance, notas, fecha, hora):
-    """Guarda edicion de una tarea existente: % cumplimiento, notas y
-    fecha/hora (para reprogramarla). El estado se deriva solo del avance:
-    100% -> Superada, lo que sea menos -> Pendiente (y si la fecha/hora
-    quedo en el futuro, el resumen la va a mostrar como 'Agendada').
-    Reactiva la alerta de 15 minutos por si la reprogramaste."""
+def actualizar_tarea_completa(id_tarea, avance, notas, fecha, hora, proyecto_id=None):
     estado = "Superado" if avance >= 100 else "Pendiente"
     data = {
         "estado": estado,
@@ -187,6 +174,7 @@ def actualizar_tarea_completa(id_tarea, avance, notas, fecha, hora):
         "fecha": str(fecha),
         "hora": str(hora),
         "alertado": False,
+        "proyecto_id": proyecto_id,
     }
     supabase.from_("tareas").update(data).eq("id", id_tarea).execute()
 
@@ -197,6 +185,62 @@ def marcar_alertado(id_tarea):
 
 def eliminar_tarea(id_tarea):
     supabase.from_("tareas").delete().eq("id", id_tarea).execute()
+
+
+# ==========================================
+# FUNCIONES DE BASE DE DATOS — PROYECTOS
+# ==========================================
+def cargar_proyectos():
+    try:
+        res = supabase.from_("proyectos").select("*").order("nombre").execute()
+        return pd.DataFrame(res.data)
+    except Exception as e:
+        st.error(f"Error al cargar proyectos (¿ya corriste la migración SQL?): {e}")
+        return pd.DataFrame()
+
+
+def crear_proyecto(nombre, categoria, responsable, notas):
+    supabase.from_("proyectos").insert(
+        {"nombre": nombre, "categoria": categoria, "responsable": responsable, "notas": notas}
+    ).execute()
+
+
+def eliminar_proyecto(proyecto_id):
+    # Las subtareas quedan sueltas (proyecto_id vuelve a NULL) gracias al
+    # "on delete set null" de la migración SQL — no se borran solas.
+    supabase.from_("proyectos").delete().eq("id", proyecto_id).execute()
+
+
+# ==========================================
+# ADJUNTOS (Supabase Storage)
+# ==========================================
+def subir_adjunto(tarea_id, archivo):
+    extension = os.path.splitext(archivo.name)[1]
+    path = f"{tarea_id}/{int(time.time())}{extension}"
+    contenido = archivo.getvalue()
+    supabase.storage.from_(BUCKET_ADJUNTOS).upload(
+        path,
+        contenido,
+        file_options={"content-type": archivo.type or "application/octet-stream"},
+    )
+    supabase.from_("tareas").update(
+        {"adjunto_path": path, "adjunto_nombre": archivo.name}
+    ).eq("id", tarea_id).execute()
+
+
+def eliminar_adjunto(tarea_id, path):
+    if path:
+        try:
+            supabase.storage.from_(BUCKET_ADJUNTOS).remove([path])
+        except Exception:
+            pass
+    supabase.from_("tareas").update(
+        {"adjunto_path": None, "adjunto_nombre": None}
+    ).eq("id", tarea_id).execute()
+
+
+def url_adjunto(path):
+    return supabase.storage.from_(BUCKET_ADJUNTOS).get_public_url(path)
 
 
 # ==========================================
@@ -285,10 +329,11 @@ def verificar_alertas(df, ahora):
 
 
 def boton_activar_alertas():
-    """Boton real (no de Streamlit) para pedir permiso de notificaciones y
-    'desbloquear' el audio del navegador. Es obligatorio un clic humano:
-    los navegadores no dejan reproducir sonido ni pedir notificaciones
-    mediante codigo sin que la persona interactue primero."""
+    """Boton real (no de Streamlit) que:
+    - Refleja si las notificaciones ya estaban concedidas de antes (para
+      no mostrar siempre 'sin activar' aunque ya lo hayas hecho).
+    - Reproduce un beep de PRUEBA al tocarlo, para que confirmes al toque
+      si el sonido funciona en ese dispositivo."""
     st.components.v1.html(
         """
         <div style="font-family: 'Segoe UI', sans-serif;">
@@ -299,28 +344,53 @@ def boton_activar_alertas():
           <span id="estado-alertas" style="margin-left:10px;font-size:13px;color:#444;"></span>
         </div>
         <script>
+        const p = window.parent;
         const boton = document.getElementById('btn-activar-alertas');
         const estado = document.getElementById('estado-alertas');
+
+        function actualizarEstadoVisual() {
+            const permisoNotif = (p.Notification && p.Notification.permission) || 'default';
+            const audioListo = !!p.__appAudioCtx;
+            if (permisoNotif === 'granted' && audioListo) {
+                boton.innerText = '🔔 Alertas activadas en este dispositivo (tocá para probar el sonido)';
+                estado.innerText = '✅ Notificaciones listas';
+            } else if (permisoNotif === 'denied') {
+                estado.innerText = '⚠️ Notificaciones bloqueadas en este navegador. El cartel rojo en pantalla igual va a avisarte.';
+            }
+        }
+
+        try {
+            if (!p.__appAudioCtx) {
+                p.__appAudioCtx = new (p.AudioContext || p.webkitAudioContext)();
+            }
+        } catch (e) {}
+
+        actualizarEstadoVisual();
+
         boton.addEventListener('click', function () {
-            const p = window.parent;
             try {
                 if (!p.__appAudioCtx) {
                     p.__appAudioCtx = new (p.AudioContext || p.webkitAudioContext)();
                 }
                 p.__appAudioCtx.resume();
+                const ctx = p.__appAudioCtx;
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.type = 'sine';
+                osc.frequency.value = 880;
+                gain.gain.setValueAtTime(0.25, ctx.currentTime);
+                osc.connect(gain).connect(ctx.destination);
+                osc.start();
+                osc.stop(ctx.currentTime + 0.3);
             } catch (e) {}
+
             if (p.Notification && p.Notification.requestPermission) {
-                p.Notification.requestPermission().then(function (perm) {
-                    estado.innerText = perm === 'granted'
-                        ? '✅ Notificaciones y sonido activados'
-                        : '⚠️ Notificaciones bloqueadas (el sonido igual quedó activo)';
+                p.Notification.requestPermission().then(function () {
+                    actualizarEstadoVisual();
                 });
             } else {
-                estado.innerText = '✅ Sonido activado';
+                actualizarEstadoVisual();
             }
-            boton.innerText = '🔔 Alertas activadas en este dispositivo';
-            boton.disabled = true;
-            boton.style.opacity = '0.7';
         });
         </script>
         """,
@@ -343,27 +413,28 @@ def _valores_por_defecto_formulario():
         "categoria_input": "ENRESP",
         "fecha_input": datetime.now().date(),
         "hora_input": _hora_por_defecto(),
+        "proyecto_input": "Ninguno",
         "ultimo_audio_hash": "",
     }
 
 
-# Si el envio anterior pidio limpiar el formulario, lo hacemos ACA, antes
-# de crear ningun widget con esas claves (Streamlit no permite tocar
-# st.session_state de un widget despues de haberlo creado en la misma
-# corrida del script).
 if st.session_state.get("_reset_formulario", False):
     for clave, valor in _valores_por_defecto_formulario().items():
         st.session_state[clave] = valor
     st.session_state["_reset_formulario"] = False
 
-# Completa las claves que todavia no existan (primera vez que corre la app).
 for clave, valor in _valores_por_defecto_formulario().items():
     if clave not in st.session_state:
         st.session_state[clave] = valor
 
 # ==========================================
-# BARRA LATERAL (ENTRADA DE DATOS)
+# BARRA LATERAL
 # ==========================================
+proyectos_df_sidebar = cargar_proyectos()
+opciones_proyecto = ["Ninguno"] + (
+    list(proyectos_df_sidebar["nombre"]) if not proyectos_df_sidebar.empty else []
+)
+
 st.sidebar.title("📌 Agendar Tarea")
 
 modo_ingreso = st.sidebar.radio(
@@ -376,10 +447,6 @@ if modo_ingreso == "🎙️ Grabar Audio de Voz":
 
     if audio_file is not None:
         audio_bytes = audio_file.getvalue()
-        # Huella digital del audio: solo transcribimos si es una grabacion
-        # NUEVA. Sin esto, Streamlit vuelve a correr este bloque en cada
-        # rerun (por ejemplo al tipear en otro campo) y pisaria el titulo
-        # o las notas que ya hayas editado a mano.
         audio_hash = hashlib.md5(audio_bytes).hexdigest()
 
         if st.session_state.ultimo_audio_hash != audio_hash:
@@ -402,27 +469,179 @@ with st.sidebar.form("form_tarea", clear_on_submit=False):
     responsable = st.text_input("Responsable", key="responsable_input")
     fecha = st.date_input("Fecha", key="fecha_input")
     hora = st.time_input("Hora de inicio", key="hora_input")
+    proyecto_sel = st.selectbox("Proyecto (opcional)", opciones_proyecto, key="proyecto_input")
     notas = st.text_area("Notas / Minuta inicial", key="notas_input")
 
-    submitted = st.form_submit_button(
-        "➕ Agendar Tarea", use_container_width=True
-    )
+    submitted = st.form_submit_button("➕ Agendar Tarea", use_container_width=True)
 
     if submitted:
         if titulo.strip() != "":
-            agregar_tarea(titulo, categoria, responsable, fecha, hora, notas)
+            proyecto_id_nuevo = None
+            if proyecto_sel != "Ninguno" and not proyectos_df_sidebar.empty:
+                coincidencia = proyectos_df_sidebar[proyectos_df_sidebar["nombre"] == proyecto_sel]
+                if not coincidencia.empty:
+                    proyecto_id_nuevo = int(coincidencia.iloc[0]["id"])
+
+            agregar_tarea(titulo, categoria, responsable, fecha, hora, notas, proyecto_id_nuevo)
 
             st.toast("🎉 ¡Tarea agregada con éxito!", icon="✅")
             st.sidebar.success("✅ Tarea registrada en la base de datos.")
 
-            # Pedimos el reset para la PROXIMA corrida del script (ver
-            # bloque de arriba), no ahora mismo.
             st.session_state["_reset_formulario"] = True
-
             time.sleep(1)
             st.rerun()
         else:
             st.sidebar.error("⚠️ Debes colocar un título a la tarea.")
+
+st.sidebar.markdown("---")
+with st.sidebar.expander("🗂️ Crear nuevo proyecto"):
+    with st.form("form_proyecto", clear_on_submit=True):
+        nombre_proy = st.text_input("Nombre del proyecto")
+        categoria_proy = st.selectbox("Categoría", ["ENRESP", "EXTERNO"], key="categoria_proyecto_input")
+        responsable_proy = st.text_input("Responsable", value="Yo", key="responsable_proyecto_input")
+        notas_proy = st.text_area("Notas", key="notas_proyecto_input")
+        crear = st.form_submit_button("➕ Crear proyecto")
+        if crear:
+            if nombre_proy.strip():
+                crear_proyecto(nombre_proy, categoria_proy, responsable_proy, notas_proy)
+                st.sidebar.success("✅ Proyecto creado.")
+                st.rerun()
+            else:
+                st.sidebar.error("⚠️ Ponele un nombre al proyecto.")
+
+# ==========================================
+# PANEL DE EDICIÓN COMPARTIDO
+# ==========================================
+def panel_edicion(tarea_id, df, proyectos_df, ahora):
+    fila = df[df["id"] == tarea_id]
+    if fila.empty:
+        return
+    row = fila.iloc[0]
+
+    clas = clasificar_tarea(row, ahora)
+    badge = {"Superada": "🟢 Superada", "Agendada": "🔵 Agendada", "Pendiente": "🔴 Pendiente"}[clas]
+    st.markdown(f"**{row['titulo']}** — {badge}")
+
+    try:
+        fecha_actual = pd.to_datetime(row["fecha"]).date()
+    except Exception:
+        fecha_actual = ahora.date()
+    try:
+        hora_actual = datetime.strptime(str(row["hora"])[:5], "%H:%M").time()
+    except Exception:
+        hora_actual = ahora.time()
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        nueva_fecha = st.date_input("Fecha", value=fecha_actual, key=f"ed_fecha_{tarea_id}")
+    with col_b:
+        nueva_hora = st.time_input("Hora", value=hora_actual, key=f"ed_hora_{tarea_id}")
+
+    pct = st.slider("% Cumplimiento", 0, 100, int(row["avance"]), key=f"ed_pct_{tarea_id}")
+    nuevas_notas = st.text_area(
+        "Notas / Acuerdos", value=row["notas"] if row["notas"] else "", key=f"ed_notas_{tarea_id}"
+    )
+
+    opciones_ed = ["Ninguno"] + (list(proyectos_df["nombre"]) if not proyectos_df.empty else [])
+    nombre_proy_actual = "Ninguno"
+    if pd.notna(row.get("proyecto_id")) and not proyectos_df.empty:
+        coincidencia = proyectos_df[proyectos_df["id"] == row["proyecto_id"]]
+        if not coincidencia.empty:
+            nombre_proy_actual = coincidencia.iloc[0]["nombre"]
+    idx_actual = opciones_ed.index(nombre_proy_actual) if nombre_proy_actual in opciones_ed else 0
+    proyecto_elegido = st.selectbox("Proyecto", opciones_ed, index=idx_actual, key=f"ed_proy_{tarea_id}")
+
+    if pct >= 100:
+        st.success("Al guardar queda como **Superada**.")
+    else:
+        fh_nueva = datetime.combine(nueva_fecha, nueva_hora)
+        if fh_nueva >= ahora:
+            st.info("Al guardar queda como **Agendada** (fecha/hora futura).")
+        else:
+            st.warning("Al guardar queda como **Pendiente**. Elegí una fecha/hora futura para agendarla.")
+
+    st.markdown("📎 **Adjunto**")
+    if row.get("adjunto_nombre"):
+        try:
+            url = url_adjunto(row["adjunto_path"])
+            st.markdown(f"[{row['adjunto_nombre']}]({url})")
+        except Exception:
+            st.caption(f"{row['adjunto_nombre']} (no se pudo generar el link)")
+        if st.button("🗑️ Quitar adjunto", key=f"ed_quitar_adj_{tarea_id}"):
+            eliminar_adjunto(tarea_id, row["adjunto_path"])
+            st.rerun()
+    else:
+        st.caption("Sin archivo adjunto todavía.")
+
+    nuevo_archivo = st.file_uploader("Subir / reemplazar adjunto", key=f"ed_file_{tarea_id}")
+    if nuevo_archivo is not None:
+        if st.button("⬆️ Guardar adjunto", key=f"ed_subir_{tarea_id}"):
+            try:
+                subir_adjunto(tarea_id, nuevo_archivo)
+                st.toast("📎 Adjunto guardado")
+                st.rerun()
+            except Exception as e:
+                st.error(f"No se pudo subir el adjunto (¿ya creaste el bucket 'adjuntos' en Supabase?): {e}")
+
+    proyecto_id_final = None
+    if proyecto_elegido != "Ninguno":
+        coincidencia = proyectos_df[proyectos_df["nombre"] == proyecto_elegido]
+        if not coincidencia.empty:
+            proyecto_id_final = int(coincidencia.iloc[0]["id"])
+
+    col_g, col_d = st.columns(2)
+    with col_g:
+        if st.button("💾 Guardar cambios", key=f"ed_guardar_{tarea_id}", use_container_width=True):
+            actualizar_tarea_completa(tarea_id, pct, nuevas_notas, nueva_fecha, nueva_hora, proyecto_id_final)
+            for k in (
+                f"ed_fecha_{tarea_id}", f"ed_hora_{tarea_id}", f"ed_pct_{tarea_id}",
+                f"ed_notas_{tarea_id}", f"ed_proy_{tarea_id}",
+            ):
+                st.session_state.pop(k, None)
+            st.toast("Guardado correctamente")
+            st.rerun()
+    with col_d:
+        if st.button("🗑️ Eliminar tarea", key=f"ed_eliminar_{tarea_id}", use_container_width=True):
+            eliminar_tarea(tarea_id)
+            st.rerun()
+
+
+# ==========================================
+# TABLA DE UN GRUPO (con selección de fila)
+# ==========================================
+COLUMNAS_TABLA = ["clasificacion", "titulo", "fecha", "hora", "categoria", "responsable", "avance", "notas"]
+NOMBRES_COLUMNAS = ["Clasificación", "Título", "Fecha", "Hora", "Categoría", "Responsable", "Avance %", "Notas"]
+
+
+def mostrar_tabla(df_grupo, key, mostrar_columna_proyecto=False):
+    if df_grupo.empty:
+        st.caption("No hay tareas en esta clasificación.")
+        return None
+
+    vista = df_grupo[COLUMNAS_TABLA].copy()
+    nombres = list(NOMBRES_COLUMNAS)
+
+    if mostrar_columna_proyecto:
+        # Insertamos "Proyecto" justo despues de "Categoria" (4to lugar)
+        vista.insert(4, "proyecto_nombre", df_grupo["proyecto_nombre"])
+        nombres = nombres[:4] + ["Proyecto"] + nombres[4:]
+
+    vista["📎"] = df_grupo["adjunto_nombre"].apply(lambda x: "📎" if x else "")
+    vista.columns = nombres + ["📎"]
+
+    evento = st.dataframe(
+        vista,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=key,
+    )
+    if evento and evento["selection"]["rows"]:
+        idx_local = evento["selection"]["rows"][0]
+        return int(df_grupo.iloc[idx_local]["id"])
+    return None
+
 
 # ==========================================
 # PANEL PRINCIPAL
@@ -437,264 +656,94 @@ st.caption(
 )
 
 df = cargar_tareas()
+proyectos_df = cargar_proyectos()
 ahora = datetime.now()
-fecha_hoy_str = ahora.strftime("%Y-%m-%d")
-
-if not df.empty:
-    df["clasificacion"] = df.apply(lambda r: clasificar_tarea(r, ahora), axis=1)
+hoy_str = ahora.strftime("%Y-%m-%d")
 
 verificar_alertas(df, ahora)
-
-vista = st.radio(
-    "Modo de Visualización:",
-    ["📊 Tablero Completo", "📱 Lista Resumen (Fácil Celular)"],
-    horizontal=True,
+st.caption(
+    f"🔄 Última revisión de alertas: {ahora.strftime('%H:%M:%S')} "
+    "(se repite sola cada 20 segundos mientras esta pantalla esté abierta)"
 )
-
 st.caption(f"📅 Día actual: **{ahora.strftime('%d/%m/%Y')}**")
 
-if not df.empty:
-    if vista == "📱 Lista Resumen (Fácil Celular)":
-        st.markdown("### 📋 Resumen Rápido de Tareas")
+id_click = None
 
-        df_resumen = df.copy()
-        df_resumen["⭐ Hoy"] = df_resumen["fecha"].apply(
-            lambda x: "⭐ ¡HOY!" if str(x) == fecha_hoy_str else "📅 Programada"
-        )
-
-        df_display = df_resumen[
-            [
-                "⭐ Hoy",
-                "clasificacion",
-                "fecha",
-                "hora",
-                "categoria",
-                "titulo",
-                "responsable",
-                "avance",
-                "notas",
-            ]
-        ].copy()
-
-        df_display.columns = [
-            "Prioridad",
-            "Clasificación",
-            "Fecha",
-            "Hora",
-            "Categoría",
-            "Título",
-            "Responsable",
-            "Avance %",
-            "Notas",
-        ]
-
-        st.dataframe(
-            df_display,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    else:
-        # ---------- MÉTRICAS ----------
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Total Tareas", len(df))
-        c2.metric("⭐ Hoy", len(df[df["fecha"] == fecha_hoy_str]))
-        c3.metric("🟢 Superadas", int((df["clasificacion"] == "Superada").sum()))
-        c4.metric("🔵 Agendadas", int((df["clasificacion"] == "Agendada").sum()))
-        c5.metric("🔴 Pendientes", int((df["clasificacion"] == "Pendiente").sum()))
-
-        st.markdown("---")
-
-        # ---------- GRÁFICO INTERACTIVO ----------
-        st.markdown("#### 📊 Carga laboral y cumplimiento de objetivos")
-
-        conteo = (
-            df.groupby(["clasificacion", "categoria"])
-            .size()
-            .reset_index(name="cantidad")
-        )
-        orden_clasificacion = ["Pendiente", "Agendada", "Superada"]
-
-        fig = px.bar(
-            conteo,
-            x="clasificacion",
-            y="cantidad",
-            color="categoria",
-            category_orders={"clasificacion": orden_clasificacion},
-            barmode="stack",
-            custom_data=["categoria"],
-            color_discrete_map={"ENRESP": "#4f6df5", "EXTERNO": "#f2994a"},
-            labels={
-                "clasificacion": "Clasificación",
-                "cantidad": "Cantidad de tareas",
-                "categoria": "Categoría",
-            },
-        )
-        fig.update_layout(
-            height=360,
-            margin=dict(t=10, b=10),
-            clickmode="event+select",
-            legend_title_text="Categoría",
-        )
-
-        evento_grafico = st.plotly_chart(
-            fig,
-            key="grafico_clasificacion",
-            on_select="rerun",
-            selection_mode="points",
-            use_container_width=True,
-        )
-
-        clas_click = None
-        cat_click = None
-        if evento_grafico and evento_grafico["selection"]["points"]:
-            punto = evento_grafico["selection"]["points"][0]
-            clas_click = punto.get("x")
-            datos_extra = punto.get("customdata")
-            cat_click = datos_extra[0] if datos_extra else None
-
-        if clas_click:
-            titulo_filtro = f"📌 Tareas — {clas_click}"
-            if cat_click:
-                titulo_filtro += f" / {cat_click}"
-            st.markdown(f"##### {titulo_filtro}")
-
-            df_click = df[df["clasificacion"] == clas_click]
-            if cat_click:
-                df_click = df_click[df_click["categoria"] == cat_click]
-
-            st.dataframe(
-                df_click[
-                    ["fecha", "hora", "categoria", "titulo", "responsable", "avance", "notas"]
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
-            st.caption("Hacé clic en otra barra para cambiar el filtro.")
-
-        st.markdown("---")
-
-        # ---------- LISTADO POR CATEGORÍA ----------
-        col_f1, col_f2 = st.columns(2)
-        with col_f1:
-            filtro_cat = st.multiselect(
-                "Categorías:",
-                ["ENRESP", "EXTERNO"],
-                default=["ENRESP", "EXTERNO"],
-            )
-        with col_f2:
-            filtro_clas = st.multiselect(
-                "Clasificación:",
-                ["Pendiente", "Agendada", "Superada"],
-                default=["Pendiente", "Agendada", "Superada"],
-            )
-
-        df_filtered = df[
-            (df["categoria"].isin(filtro_cat))
-            & (df["clasificacion"].isin(filtro_clas))
-        ]
-
-        for cat in ["ENRESP", "EXTERNO"]:
-            if cat in filtro_cat:
-                df_cat = df_filtered[df_filtered["categoria"] == cat]
-                st.subheader(f"📂 Categoría: {cat}")
-
-                if not df_cat.empty:
-                    for idx, row in df_cat.iterrows():
-                        es_hoy = str(row["fecha"]) == fecha_hoy_str
-                        clas = row["clasificacion"]
-                        badge_texto = {
-                            "Superada": "🟢 Superada",
-                            "Agendada": "🔵 Agendada",
-                            "Pendiente": "🔴 Pendiente",
-                        }[clas]
-
-                        with st.container():
-                            col1, col2, col3, col4 = st.columns([3, 2, 1.6, 1.3])
-
-                            with col1:
-                                if es_hoy:
-                                    st.markdown(
-                                        f"⭐ **{row['titulo']}** <span style='color:#2563eb;'>(¡HOY!)</span>",
-                                        unsafe_allow_html=True,
-                                    )
-                                else:
-                                    st.markdown(f"**{row['titulo']}**")
-                                st.caption(f"👤 {row['responsable']}")
-
-                            with col2:
-                                st.caption(f"📅 {row['fecha']}  ⏰ {str(row['hora'])[:5]}")
-                                st.markdown(badge_texto)
-
-                            with col3:
-                                st.progress(min(int(row["avance"]), 100) / 100)
-                                st.caption(f"{int(row['avance'])}% cumplido")
-
-                            with col4:
-                                with st.popover("✏️ Editar", use_container_width=True):
-                                    st.markdown(f"**{row['titulo']}**")
-                                    st.caption(f"Clasificación actual: {badge_texto}")
-
-                                    try:
-                                        fecha_actual = pd.to_datetime(row["fecha"]).date()
-                                    except Exception:
-                                        fecha_actual = ahora.date()
-                                    try:
-                                        hora_actual = datetime.strptime(
-                                            str(row["hora"])[:5], "%H:%M"
-                                        ).time()
-                                    except Exception:
-                                        hora_actual = ahora.time()
-
-                                    nueva_fecha = st.date_input(
-                                        "Fecha", value=fecha_actual, key=f"fecha_{row['id']}"
-                                    )
-                                    nueva_hora = st.time_input(
-                                        "Hora", value=hora_actual, key=f"hora_{row['id']}"
-                                    )
-                                    pct = st.slider(
-                                        "% Cumplimiento",
-                                        0, 100, int(row["avance"]),
-                                        key=f"pct_{row['id']}",
-                                    )
-                                    nuevas_notas = st.text_area(
-                                        "Notas / Acuerdos",
-                                        value=row["notas"] if row["notas"] else "",
-                                        key=f"nt_{row['id']}",
-                                    )
-
-                                    if pct >= 100:
-                                        st.success("Al guardar queda como **Superada**.")
-                                    else:
-                                        fh_nueva = datetime.combine(nueva_fecha, nueva_hora)
-                                        if fh_nueva >= ahora:
-                                            st.info("Al guardar queda como **Agendada** (fecha/hora futura).")
-                                        else:
-                                            st.warning(
-                                                "Al guardar queda como **Pendiente** (sin fecha futura). "
-                                                "Elegí una fecha/hora futura para agendarla."
-                                            )
-
-                                    bc1, bc2 = st.columns(2)
-                                    with bc1:
-                                        if st.button("💾 Guardar", key=f"sv_{row['id']}", use_container_width=True):
-                                            actualizar_tarea_completa(
-                                                row["id"], pct, nuevas_notas, nueva_fecha, nueva_hora
-                                            )
-                                            for k in (
-                                                f"fecha_{row['id']}", f"hora_{row['id']}",
-                                                f"pct_{row['id']}", f"nt_{row['id']}",
-                                            ):
-                                                st.session_state.pop(k, None)
-                                            st.toast("Guardado correctamente")
-                                            st.rerun()
-                                    with bc2:
-                                        if st.button("🗑️ Eliminar", key=f"del_{row['id']}", use_container_width=True):
-                                            eliminar_tarea(row["id"])
-                                            st.rerun()
-
-                        st.divider()
-                else:
-                    st.caption("Sin tareas en esta categoría.")
+if df.empty and proyectos_df.empty:
+    st.info("No hay tareas ni proyectos registrados todavía. Agregá el primero desde la barra lateral.")
 else:
-    st.info("No hay tareas registradas en la base de datos.")
+    id_a_nombre_proyecto = {}
+    if not proyectos_df.empty:
+        id_a_nombre_proyecto = {int(r["id"]): r["nombre"] for _, r in proyectos_df.iterrows()}
+
+    df_todas = df.copy()
+    if not df_todas.empty:
+        df_todas["clasificacion"] = df_todas.apply(lambda r: clasificar_tarea(r, ahora), axis=1)
+        df_todas["proyecto_nombre"] = df_todas["proyecto_id"].apply(
+            lambda x: id_a_nombre_proyecto.get(int(x), "") if pd.notna(x) else ""
+        )
+        es_hoy_mask = df_todas["fecha"].astype(str) == hoy_str
+        grupo_hoy = df_todas[es_hoy_mask]
+        resto = df_todas[~es_hoy_mask]
+        grupo_agendada = resto[resto["clasificacion"] == "Agendada"]
+        grupo_pendiente = resto[resto["clasificacion"] == "Pendiente"]
+        grupo_superada = resto[resto["clasificacion"] == "Superada"]
+    else:
+        grupo_hoy = grupo_agendada = grupo_pendiente = grupo_superada = df_todas
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total tareas", len(df_todas))
+    c2.metric("⭐ Hoy", len(grupo_hoy))
+    c3.metric("🔵 Programadas", len(grupo_agendada))
+    c4.metric("🔴 Pendientes", len(grupo_pendiente))
+    c5.metric("🟢 Superadas", len(grupo_superada))
+
+    st.markdown("---")
+    st.caption("Las tareas que pertenecen a un proyecto también aparecen acá (columna \"Proyecto\"), además de dentro de su proyecto más abajo.")
+    st.markdown("### ⭐ Hoy")
+    id_click = mostrar_tabla(grupo_hoy, "tabla_hoy", mostrar_columna_proyecto=True) or id_click
+
+    st.markdown("### 🔵 Programadas")
+    id_click = mostrar_tabla(grupo_agendada, "tabla_agendada", mostrar_columna_proyecto=True) or id_click
+
+    st.markdown("### 🔴 Pendientes")
+    id_click = mostrar_tabla(grupo_pendiente, "tabla_pendiente", mostrar_columna_proyecto=True) or id_click
+
+    st.markdown("### 🟢 Superadas")
+    id_click = mostrar_tabla(grupo_superada, "tabla_superada", mostrar_columna_proyecto=True) or id_click
+
+    st.markdown("### 📁 Proyectos")
+    if proyectos_df.empty:
+        st.caption("Todavía no creaste ningún proyecto (podés hacerlo desde la barra lateral).")
+    else:
+        for _, proyecto in proyectos_df.iterrows():
+            subtareas = df[df["proyecto_id"] == proyecto["id"]] if not df.empty else pd.DataFrame()
+            if not subtareas.empty:
+                subtareas = subtareas.copy()
+                subtareas["clasificacion"] = subtareas.apply(lambda r: clasificar_tarea(r, ahora), axis=1)
+                promedio = subtareas["avance"].mean()
+            else:
+                promedio = 0
+
+            if promedio >= 100:
+                color = "🟢"
+            elif promedio > 0:
+                color = "🟡"
+            else:
+                color = "⚪"
+
+            with st.expander(f"{color} {proyecto['nombre']} — {promedio:.0f}% completado ({len(subtareas)} subtareas)"):
+                if proyecto.get("notas"):
+                    st.caption(proyecto["notas"])
+                if subtareas.empty:
+                    st.caption("Sin subtareas todavía. Creá una tarea nueva y asignale este proyecto.")
+                else:
+                    id_click = mostrar_tabla(subtareas, f"tabla_proy_{proyecto['id']}") or id_click
+                if st.button("🗑️ Eliminar proyecto", key=f"del_proy_{proyecto['id']}"):
+                    eliminar_proyecto(proyecto["id"])
+                    st.rerun()
+
+    if id_click:
+        st.markdown("---")
+        st.markdown("### ✏️ Editar tarea seleccionada")
+        panel_edicion(id_click, df, proyectos_df, ahora)
