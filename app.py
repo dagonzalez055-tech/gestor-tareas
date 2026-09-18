@@ -682,7 +682,7 @@ else:
         df_todas["proyecto_nombre"] = df_todas["proyecto_id"].apply(
             lambda x: id_a_nombre_proyecto.get(int(x), "") if pd.notna(x) else ""
         )
-        es_hoy_mask = df_todas["fecha"].astype(str) == hoy_str
+        es_hoy_mask = (df_todas["fecha"].astype(str) == hoy_str) & (df_todas["clasificacion"] != "Superada")
         grupo_hoy = df_todas[es_hoy_mask]
         resto = df_todas[~es_hoy_mask]
         grupo_agendada = resto[resto["clasificacion"] == "Agendada"]
