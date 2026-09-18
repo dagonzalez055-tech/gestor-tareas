@@ -1,0 +1,6 @@
+streamlit
+pandas
+supabase
+SpeechRecognition
+plotly
+streamlit-autorefresh
