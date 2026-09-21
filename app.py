@@ -673,12 +673,33 @@ NOMBRES_MES_ES = [
     "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
 ]
 DIAS_SEMANA_ES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
-ICONO_CLASIFICACION = {"Superada": "🟢", "Agendada": "🔵", "Pendiente": "🔴"}
+
+# (color de fondo, color de texto) de cada "barrita" de tarea, estilo Google Calendar
+COLOR_CLASIFICACION = {
+    "Superada": "#22c55e",
+    "Agendada": "#3b82f6",
+    "Pendiente": "#ef4444",
+}
+MAX_TAREAS_VISIBLES_POR_DIA = 3
+
+
+def _escapar_html(texto):
+    return (
+        str(texto)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
 def mostrar_calendario_mes(df, ahora):
     hoy = ahora.date()
-    st.caption(f"{NOMBRES_MES_ES[hoy.month]} {hoy.year}")
+    st.markdown(
+        f"<div style='font-size:1.1rem;font-weight:700;color:#1e293b;margin-bottom:0.6rem;'>"
+        f"{NOMBRES_MES_ES[hoy.month]} {hoy.year}</div>",
+        unsafe_allow_html=True,
+    )
 
     tareas_por_dia = {}
     if not df.empty:
@@ -692,45 +713,87 @@ def mostrar_calendario_mes(df, ahora):
 
     semanas = calendar_mod.Calendar(firstweekday=0).monthdayscalendar(hoy.year, hoy.month)
 
-    encabezados = st.columns(7)
-    for i, nombre_dia in enumerate(DIAS_SEMANA_ES):
-        encabezados[i].markdown(f"**{nombre_dia}**")
+    # Encabezado de días de la semana
+    celdas_encabezado = "".join(
+        f"<div style='flex:1;text-align:center;font-size:11px;font-weight:700;"
+        f"color:#64748b;text-transform:uppercase;letter-spacing:0.04em;padding-bottom:6px;'>"
+        f"{nombre}</div>"
+        for nombre in DIAS_SEMANA_ES
+    )
 
+    filas_html = ""
     for semana in semanas:
-        columnas = st.columns(7)
-        for i, dia in enumerate(semana):
-            with columnas[i]:
-                if dia == 0:
-                    st.markdown("&nbsp;", unsafe_allow_html=True)
-                    continue
+        celdas_html = ""
+        for dia in semana:
+            if dia == 0:
+                celdas_html += (
+                    "<div style='flex:1;min-height:100px;margin:2px;'></div>"
+                )
+                continue
 
-                es_hoy_dia = dia == hoy.day
-                tareas_dia = sorted(
-                    tareas_por_dia.get(dia, []), key=lambda r: str(r["hora"])
+            es_hoy_dia = dia == hoy.day
+            tareas_dia = sorted(
+                tareas_por_dia.get(dia, []), key=lambda r: str(r["hora"])
+            )
+
+            if es_hoy_dia:
+                numero_html = (
+                    "<span style='background:#3b82f6;color:#ffffff;border-radius:999px;"
+                    "width:22px;height:22px;display:inline-flex;align-items:center;"
+                    "justify-content:center;font-weight:700;font-size:12px;'>"
+                    f"{dia}</span>"
+                )
+            else:
+                numero_html = (
+                    f"<span style='color:#1e293b;font-weight:600;font-size:12px;'>{dia}</span>"
                 )
 
-                estilo = (
-                    "background-color:#eff6ff;border:2px solid #3b82f6;"
-                    if es_hoy_dia
-                    else "background-color:#ffffff;border:1px solid #e2e8f0;"
+            barras_html = ""
+            for t in tareas_dia[:MAX_TAREAS_VISIBLES_POR_DIA]:
+                clas = clasificar_tarea(t, ahora)
+                color = COLOR_CLASIFICACION.get(clas, "#94a3b8")
+                hora_corta = str(t["hora"])[:5]
+                titulo_full = _escapar_html(t["titulo"])
+                barras_html += (
+                    f"<div title='{hora_corta} {titulo_full}' style='background:{color};"
+                    "color:#ffffff;border-radius:4px;padding:1px 5px;margin-top:3px;"
+                    "font-size:10.5px;line-height:15px;white-space:nowrap;overflow:hidden;"
+                    f"text-overflow:ellipsis;'>{hora_corta} {titulo_full}</div>"
                 )
-                html = (
-                    f"<div style='{estilo}border-radius:6px;padding:6px;"
-                    f"min-height:78px;font-size:11.5px;'>"
+            restantes = len(tareas_dia) - MAX_TAREAS_VISIBLES_POR_DIA
+            if restantes > 0:
+                barras_html += (
+                    f"<div style='font-size:10px;color:#64748b;margin-top:2px;'>"
+                    f"+{restantes} más</div>"
                 )
-                html += f"<b>{dia}</b><br>"
-                for t in tareas_dia[:4]:
-                    clas = clasificar_tarea(t, ahora)
-                    icono = ICONO_CLASIFICACION.get(clas, "⚪")
-                    hora_corta = str(t["hora"])[:5]
-                    titulo_corto = str(t["titulo"])[:14]
-                    html += f"{icono} {hora_corta} {titulo_corto}<br>"
-                if len(tareas_dia) > 4:
-                    html += f"<span style='color:#64748b;'>+{len(tareas_dia) - 4} más</span>"
-                html += "</div>"
-                st.markdown(html, unsafe_allow_html=True)
 
-    st.caption("🟢 Superada · 🔵 Programada/Agendada · 🔴 Pendiente")
+            fondo = "#eff6ff" if es_hoy_dia else "#ffffff"
+            borde = "1.5px solid #3b82f6" if es_hoy_dia else "1px solid #e2e8f0"
+            celdas_html += (
+                f"<div style='flex:1;min-height:100px;margin:2px;padding:6px;"
+                f"background:{fondo};border:{borde};border-radius:8px;overflow:hidden;'>"
+                f"{numero_html}{barras_html}</div>"
+            )
+        filas_html += f"<div style='display:flex;'>{celdas_html}</div>"
+
+    html_completo = (
+        "<div style='font-family:\"Segoe UI\", Roboto, sans-serif;'>"
+        f"<div style='display:flex;'>{celdas_encabezado}</div>"
+        f"{filas_html}"
+        "</div>"
+    )
+    st.markdown(html_completo, unsafe_allow_html=True)
+
+    st.markdown(
+        "<div style='margin-top:0.6rem;font-size:12.5px;color:#475569;'>"
+        "<span style='background:#22c55e;color:#fff;border-radius:4px;padding:1px 6px;'>Superada</span>"
+        "&nbsp;&nbsp;"
+        "<span style='background:#3b82f6;color:#fff;border-radius:4px;padding:1px 6px;'>Programada / Agendada</span>"
+        "&nbsp;&nbsp;"
+        "<span style='background:#ef4444;color:#fff;border-radius:4px;padding:1px 6px;'>Pendiente</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
 
 # ==========================================
