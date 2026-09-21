@@ -1,9 +1,12 @@
+import calendar as calendar_mod
 import hashlib
 import io
 import json
 import os
 import time
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
@@ -22,6 +25,25 @@ st.set_page_config(
 
 MINUTOS_ALERTA = 15
 BUCKET_ADJUNTOS = "adjuntos"
+
+# ==========================================
+# ZONA HORARIA (Buenos Aires) — clave para que las alertas de
+# "faltan 15 minutos" se disparen en el momento correcto sin
+# importar en qué huso horario corra el servidor (Streamlit Cloud
+# suele correr en UTC).
+# ==========================================
+ZONA_HORARIA = ZoneInfo("America/Buenos_Aires")
+
+
+def ahora_local():
+    """Hora actual en Buenos Aires, como datetime 'naive' (sin tzinfo).
+
+    Se le quita el tzinfo a propósito: las fechas/horas que carga el
+    usuario en el formulario también son 'naive' (representan la hora
+    de pared de Buenos Aires), así que comparamos siempre naive-contra-
+    naive, ambas en la misma zona horaria real."""
+    return datetime.now(ZONA_HORARIA).replace(tzinfo=None)
+
 
 # ==========================================
 # PWA: hacer la app instalable (icono en pantalla de inicio)
@@ -402,7 +424,7 @@ def boton_activar_alertas():
 # ESTADO DEL FORMULARIO (sidebar)
 # ==========================================
 def _hora_por_defecto():
-    return (datetime.now() + timedelta(minutes=30)).time()
+    return (ahora_local() + timedelta(minutes=30)).time()
 
 
 def _valores_por_defecto_formulario():
@@ -411,7 +433,7 @@ def _valores_por_defecto_formulario():
         "notas_input": "",
         "responsable_input": "Yo",
         "categoria_input": "ENRESP",
-        "fecha_input": datetime.now().date(),
+        "fecha_input": ahora_local().date(),
         "hora_input": _hora_por_defecto(),
         "proyecto_input": "Ninguno",
         "ultimo_audio_hash": "",
@@ -459,7 +481,7 @@ if modo_ingreso == "🎙️ Grabar Audio de Voz":
             if texto:
                 st.session_state.titulo_input = texto[:80]
                 st.session_state.notas_input = texto
-                st.sidebar.success(f"✅ Transcripto: \u201c{texto[:60]}{'...' if len(texto) > 60 else ''}\u201d")
+                st.sidebar.success(f"✅ Transcripto: “{texto[:60]}{'...' if len(texto) > 60 else ''}”")
             else:
                 st.sidebar.error(f"⚠️ No se pudo transcribir el audio: {error}")
 
@@ -644,6 +666,74 @@ def mostrar_tabla(df_grupo, key, mostrar_columna_proyecto=False):
 
 
 # ==========================================
+# CALENDARIO DEL MES ACTUAL
+# ==========================================
+NOMBRES_MES_ES = [
+    "", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+    "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+]
+DIAS_SEMANA_ES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+ICONO_CLASIFICACION = {"Superada": "🟢", "Agendada": "🔵", "Pendiente": "🔴"}
+
+
+def mostrar_calendario_mes(df, ahora):
+    hoy = ahora.date()
+    st.caption(f"{NOMBRES_MES_ES[hoy.month]} {hoy.year}")
+
+    tareas_por_dia = {}
+    if not df.empty:
+        for _, row in df.iterrows():
+            try:
+                f = pd.to_datetime(row["fecha"]).date()
+            except Exception:
+                continue
+            if f.year == hoy.year and f.month == hoy.month:
+                tareas_por_dia.setdefault(f.day, []).append(row)
+
+    semanas = calendar_mod.Calendar(firstweekday=0).monthdayscalendar(hoy.year, hoy.month)
+
+    encabezados = st.columns(7)
+    for i, nombre_dia in enumerate(DIAS_SEMANA_ES):
+        encabezados[i].markdown(f"**{nombre_dia}**")
+
+    for semana in semanas:
+        columnas = st.columns(7)
+        for i, dia in enumerate(semana):
+            with columnas[i]:
+                if dia == 0:
+                    st.markdown("&nbsp;", unsafe_allow_html=True)
+                    continue
+
+                es_hoy_dia = dia == hoy.day
+                tareas_dia = sorted(
+                    tareas_por_dia.get(dia, []), key=lambda r: str(r["hora"])
+                )
+
+                estilo = (
+                    "background-color:#eff6ff;border:2px solid #3b82f6;"
+                    if es_hoy_dia
+                    else "background-color:#ffffff;border:1px solid #e2e8f0;"
+                )
+                html = (
+                    f"<div style='{estilo}border-radius:6px;padding:6px;"
+                    f"min-height:78px;font-size:11.5px;'>"
+                )
+                html += f"<b>{dia}</b><br>"
+                for t in tareas_dia[:4]:
+                    clas = clasificar_tarea(t, ahora)
+                    icono = ICONO_CLASIFICACION.get(clas, "⚪")
+                    hora_corta = str(t["hora"])[:5]
+                    titulo_corto = str(t["titulo"])[:14]
+                    html += f"{icono} {hora_corta} {titulo_corto}<br>"
+                if len(tareas_dia) > 4:
+                    html += f"<span style='color:#64748b;'>+{len(tareas_dia) - 4} más</span>"
+                html += "</div>"
+                st.markdown(html, unsafe_allow_html=True)
+
+    st.caption("🟢 Superada · 🔵 Programada/Agendada · 🔴 Pendiente")
+
+
+# ==========================================
 # PANEL PRINCIPAL
 # ==========================================
 st.title("Planificación de Proyectos")
@@ -657,12 +747,12 @@ st.caption(
 
 df = cargar_tareas()
 proyectos_df = cargar_proyectos()
-ahora = datetime.now()
+ahora = ahora_local()
 hoy_str = ahora.strftime("%Y-%m-%d")
 
 verificar_alertas(df, ahora)
 st.caption(
-    f"🔄 Última revisión de alertas: {ahora.strftime('%H:%M:%S')} "
+    f"🔄 Última revisión de alertas: {ahora.strftime('%H:%M:%S')} (hora Argentina) "
     "(se repite sola cada 20 segundos mientras esta pantalla esté abierta)"
 )
 st.caption(f"📅 Día actual: **{ahora.strftime('%d/%m/%Y')}**")
@@ -690,13 +780,6 @@ else:
         grupo_superada = resto[resto["clasificacion"] == "Superada"]
     else:
         grupo_hoy = grupo_agendada = grupo_pendiente = grupo_superada = df_todas
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Total tareas", len(df_todas))
-    c2.metric("⭐ Hoy", len(grupo_hoy))
-    c3.metric("🔵 Programadas", len(grupo_agendada))
-    c4.metric("🔴 Pendientes", len(grupo_pendiente))
-    c5.metric("🟢 Superadas", len(grupo_superada))
 
     st.markdown("---")
     st.caption("Las tareas que pertenecen a un proyecto también aparecen acá (columna \"Proyecto\"), además de dentro de su proyecto más abajo.")
@@ -747,3 +830,10 @@ else:
         st.markdown("---")
         st.markdown("### ✏️ Editar tarea seleccionada")
         panel_edicion(id_click, df, proyectos_df, ahora)
+
+# ==========================================
+# RESUMEN EN FORMATO CALENDARIO (siempre al final)
+# ==========================================
+st.markdown("---")
+st.markdown("## 🗓️ Calendario del mes")
+mostrar_calendario_mes(df, ahora)
