@@ -4,3 +4,5 @@ supabase
 SpeechRecognition
 streamlit-autorefresh
 tzdata
+google-api-python-client
+google-auth
