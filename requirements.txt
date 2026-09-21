@@ -3,3 +3,4 @@ pandas
 supabase
 SpeechRecognition
 streamlit-autorefresh
+tzdata
