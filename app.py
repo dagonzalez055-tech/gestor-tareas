@@ -32,7 +32,9 @@ BUCKET_ADJUNTOS = "adjuntos"
 # importar en qué huso horario corra el servidor (Streamlit Cloud
 # suele correr en UTC).
 # ==========================================
-ZONA_HORARIA = ZoneInfo("America/Buenos_Aires")
+# Nombre canónico IANA (el que también entiende Google Calendar).
+ZONA_HORARIA_IANA = "America/Argentina/Buenos_Aires"
+ZONA_HORARIA = ZoneInfo(ZONA_HORARIA_IANA)
 
 
 def ahora_local():
@@ -110,6 +112,129 @@ def init_supabase():
 
 supabase = init_supabase()
 
+# ==========================================
+# GOOGLE CALENDAR (opcional)
+# ==========================================
+# Sirve para que el aviso de 15 minutos te llegue al celular aunque la app
+# esté cerrada: lo manda Google Calendar, no esta app.
+#
+# MUY IMPORTANTE: en la API de Google, los recordatorios son PRIVADOS de cada
+# usuario. Si acá pusiéramos "recordarme 15 minutos antes", ese recordatorio
+# sería de la cuenta de servicio y a vos NO te llegaría nada. Por eso los
+# eventos se crean con useDefault=True y el recordatorio de 15 minutos se
+# configura UNA VEZ en el calendario, desde tu cuenta de Google.
+GOOGLE_CALENDAR_ID = st.secrets.get(
+    "GOOGLE_CALENDAR_ID", os.environ.get("GOOGLE_CALENDAR_ID", "")
+)
+
+
+@st.cache_resource
+def init_google_calendar():
+    """Devuelve el cliente de Google Calendar, o None si todavía no lo
+    configuraste. La app funciona igual sin esto (solo que sin avisos en el
+    celular con la pantalla apagada)."""
+    if not GOOGLE_CALENDAR_ID:
+        return None
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+    except ImportError:
+        return None
+    try:
+        info = dict(st.secrets["gcp_service_account"])
+    except Exception:
+        return None
+    try:
+        credenciales = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/calendar.events"]
+        )
+        return build("calendar", "v3", credentials=credenciales, cache_discovery=False)
+    except Exception:
+        return None
+
+
+calendario = init_google_calendar()
+CALENDAR_ACTIVO = calendario is not None
+
+
+def _iso_fecha_hora(fecha, hora):
+    """Arma el formato que espera Google Calendar: 2026-09-21T15:30:00"""
+    hora_str = str(hora)
+    if len(hora_str) == 5:
+        hora_str += ":00"
+    return f"{fecha}T{hora_str}"
+
+
+def _cuerpo_evento(titulo, notas, fecha, hora, hora_fin, categoria, responsable, superada=False):
+    descripcion = []
+    if categoria:
+        descripcion.append(f"Categoría: {categoria}")
+    if responsable:
+        descripcion.append(f"Responsable: {responsable}")
+    if notas:
+        descripcion.append(f"\n{notas}")
+    descripcion.append("\n— Creado por tu app de tareas")
+
+    return {
+        "summary": f"{'✅ ' if superada else ''}{titulo}",
+        "description": "\n".join(descripcion),
+        "start": {"dateTime": _iso_fecha_hora(fecha, hora), "timeZone": ZONA_HORARIA_IANA},
+        "end": {"dateTime": _iso_fecha_hora(fecha, hora_fin), "timeZone": ZONA_HORARIA_IANA},
+        # useDefault=True => se aplica el recordatorio por defecto que vos
+        # configuraste en ese calendario (los 15 minutos). Ver comentario arriba.
+        "reminders": {"useDefault": True},
+    }
+
+
+def crear_evento_calendar(titulo, notas, fecha, hora, hora_fin, categoria, responsable):
+    """Crea el evento y devuelve su id, o None si falla / no está configurado.
+    Nunca corta el guardado de la tarea."""
+    if not CALENDAR_ACTIVO:
+        return None
+    try:
+        evento = (
+            calendario.events()
+            .insert(
+                calendarId=GOOGLE_CALENDAR_ID,
+                body=_cuerpo_evento(titulo, notas, fecha, hora, hora_fin, categoria, responsable),
+            )
+            .execute()
+        )
+        return evento.get("id")
+    except Exception as e:
+        st.warning(f"⚠️ La tarea se guardó, pero no se pudo crear el evento en Google Calendar: {e}")
+        return None
+
+
+def actualizar_evento_calendar(
+    evento_id, titulo, notas, fecha, hora, hora_fin, categoria, responsable, superada=False
+):
+    """Actualiza el evento existente. Si no había evento, lo crea.
+    Devuelve el id del evento (nuevo o el mismo)."""
+    if not CALENDAR_ACTIVO:
+        return evento_id
+    cuerpo = _cuerpo_evento(titulo, notas, fecha, hora, hora_fin, categoria, responsable, superada)
+    if not evento_id:
+        return crear_evento_calendar(titulo, notas, fecha, hora, hora_fin, categoria, responsable)
+    try:
+        calendario.events().update(
+            calendarId=GOOGLE_CALENDAR_ID, eventId=evento_id, body=cuerpo
+        ).execute()
+        return evento_id
+    except Exception:
+        # Si el evento fue borrado a mano desde Google Calendar, lo recreamos.
+        return crear_evento_calendar(titulo, notas, fecha, hora, hora_fin, categoria, responsable)
+
+
+def eliminar_evento_calendar(evento_id):
+    if not CALENDAR_ACTIVO or not evento_id:
+        return
+    try:
+        calendario.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=evento_id).execute()
+    except Exception:
+        pass
+
+
 # Refresca el script solo (sin recargar la pagina) cada 20 segundos, para
 # que las alertas de "faltan 15 minutos" se disparen aunque no estes
 # tocando nada en pantalla. OJO: esto solo funciona mientras la pestaña
@@ -149,7 +274,7 @@ def _normalizar_columnas_tareas(df):
     """Por si la migración de proyecto_id/adjuntos todavía no se corrió:
     evita que la app se rompa, simplemente esas funciones no van a tener
     efecto hasta que corras el SQL correspondiente."""
-    for col in ("proyecto_id", "adjunto_path", "adjunto_nombre", "hora_fin"):
+    for col in ("proyecto_id", "adjunto_path", "adjunto_nombre", "hora_fin", "evento_calendar_id"):
         if col not in df.columns:
             df[col] = None
     return df
@@ -185,10 +310,19 @@ def agregar_tarea(titulo, categoria, responsable, fecha, hora, hora_fin, notas, 
         "alertado": False,
         "proyecto_id": proyecto_id,
     }
+
+    # El evento de Google Calendar es lo que te va a avisar en el celular
+    # aunque la app esté cerrada.
+    evento_id = crear_evento_calendar(titulo, notas, fecha, hora, hora_fin, categoria, responsable)
+    if evento_id:
+        data["evento_calendar_id"] = evento_id
+
     supabase.from_("tareas").insert(data).execute()
 
 
-def actualizar_tarea_completa(id_tarea, avance, notas, fecha, hora, hora_fin, proyecto_id=None):
+def actualizar_tarea_completa(
+    id_tarea, avance, notas, fecha, hora, hora_fin, proyecto_id=None, fila_original=None
+):
     estado = "Superado" if avance >= 100 else "Pendiente"
     data = {
         "estado": estado,
@@ -200,6 +334,25 @@ def actualizar_tarea_completa(id_tarea, avance, notas, fecha, hora, hora_fin, pr
         "alertado": False,
         "proyecto_id": proyecto_id,
     }
+
+    if fila_original is not None:
+        evento_previo = fila_original.get("evento_calendar_id")
+        if evento_previo is not None and isinstance(evento_previo, float) and pd.isna(evento_previo):
+            evento_previo = None
+        evento_id = actualizar_evento_calendar(
+            evento_previo,
+            fila_original["titulo"],
+            notas,
+            fecha,
+            hora,
+            hora_fin,
+            fila_original.get("categoria", ""),
+            fila_original.get("responsable", ""),
+            superada=(avance >= 100),
+        )
+        if evento_id:
+            data["evento_calendar_id"] = evento_id
+
     supabase.from_("tareas").update(data).eq("id", id_tarea).execute()
 
 
@@ -207,7 +360,8 @@ def marcar_alertado(id_tarea):
     supabase.from_("tareas").update({"alertado": True}).eq("id", id_tarea).execute()
 
 
-def eliminar_tarea(id_tarea):
+def eliminar_tarea(id_tarea, evento_calendar_id=None):
+    eliminar_evento_calendar(evento_calendar_id)
     supabase.from_("tareas").delete().eq("id", id_tarea).execute()
 
 
@@ -275,6 +429,30 @@ def _parsear_fecha_hora(fecha, hora):
     if len(hora_str) == 5:
         hora_str += ":00"
     return datetime.strptime(f"{fecha} {hora_str}", "%Y-%m-%d %H:%M:%S")
+
+
+def calcular_hora_fin(hora_inicio, duracion_minutos):
+    """Devuelve (hora_fin, cruza_medianoche) a partir de la hora de inicio y
+    la duración en minutos.
+
+    Trabajamos con DURACIÓN en vez de pedir una "hora de fin" suelta: así es
+    imposible que el fin quede antes del inicio (el error que se podía colar
+    cuando eran dos horas independientes)."""
+    base = datetime(2000, 1, 1, hora_inicio.hour, hora_inicio.minute)
+    fin = base + timedelta(minutes=int(duracion_minutos))
+    cruza_medianoche = fin.date() != base.date()
+    return fin.time(), cruza_medianoche
+
+
+def duracion_en_minutos(hora_inicio, hora_fin):
+    """Minutos entre dos horas del mismo día (mínimo 5, para el panel de edición)."""
+    try:
+        base = datetime(2000, 1, 1, hora_inicio.hour, hora_inicio.minute)
+        fin = datetime(2000, 1, 1, hora_fin.hour, hora_fin.minute)
+        minutos = int((fin - base).total_seconds() / 60)
+        return minutos if minutos >= 5 else 30
+    except Exception:
+        return 30
 
 
 def _hora_fin_efectiva(row):
@@ -351,12 +529,32 @@ def obtener_tareas_para_alertar(df, ahora):
 
 
 def verificar_alertas(df, ahora):
+    """Detecta las tareas que entran en la ventana de 15 minutos y las guarda
+    en session_state.
+
+    IMPORTANTE: antes el cartel de alerta se dibujaba acá mismo y solo existía
+    durante ESE rerun, así que el autorefresco de 20 segundos lo borraba. Si en
+    esos segundos no estabas mirando la pantalla, la alerta se perdía para
+    siempre (ese era el motivo de "a veces la vi y a veces solo sonó").
+    Ahora las alertas quedan guardadas hasta que las cerrás vos a mano."""
+    if "alertas_pendientes" not in st.session_state:
+        st.session_state["alertas_pendientes"] = []
+
+    ids_ya_listados = {a["id"] for a in st.session_state["alertas_pendientes"]}
+
     for row, minutos_restantes in obtener_tareas_para_alertar(df, ahora):
         marcar_alertado(row["id"])
+        if int(row["id"]) in ids_ya_listados:
+            continue
 
-        st.error(
-            f"🚨 **¡Tarea próxima! (en {minutos_restantes} min)**\n\n"
-            f"📌 **{row['titulo']}**  |  📂 {row['categoria']}  |  ⏰ {str(row['hora'])[:5]}"
+        st.session_state["alertas_pendientes"].append(
+            {
+                "id": int(row["id"]),
+                "titulo": str(row["titulo"]),
+                "categoria": str(row["categoria"]),
+                "hora": str(row["hora"])[:5],
+                "minutos": minutos_restantes,
+            }
         )
         st.toast(f"⏰ En {minutos_restantes} min: {row['titulo']}", icon="🚨")
 
@@ -371,7 +569,11 @@ def verificar_alertas(df, ahora):
                     body: {titulo_js},
                     icon: '/app/static/icon-192.png',
                     badge: '/app/static/icon-192.png',
-                    tag: 'alerta-tarea-{row["id"]}-{minutos_restantes}',
+                    // "requireInteraction" hace que la notificación quede fija en
+                    // pantalla hasta que la cierres, en vez de auto-ocultarse a los
+                    // pocos segundos (otra razón por la que a veces no la veías).
+                    requireInteraction: true,
+                    tag: 'alerta-tarea-{row["id"]}-{int(time.time())}',
                     vibrate: [200, 100, 200]
                 }};
                 if (p.Notification && p.Notification.permission === 'granted') {{
@@ -399,14 +601,17 @@ def verificar_alertas(df, ahora):
                 try {{
                     if (p.__appAudioCtx) {{
                         const ctx = p.__appAudioCtx;
-                        const osc = ctx.createOscillator();
-                        const gain = ctx.createGain();
-                        osc.type = 'sine';
-                        osc.frequency.value = 880;
-                        gain.gain.setValueAtTime(0.2, ctx.currentTime);
-                        osc.connect(gain).connect(ctx.destination);
-                        osc.start();
-                        osc.stop(ctx.currentTime + 0.35);
+                        // Triple beep, más difícil de pasar por alto que uno solo.
+                        [0, 0.45, 0.9].forEach(function (offset) {{
+                            const osc = ctx.createOscillator();
+                            const gain = ctx.createGain();
+                            osc.type = 'sine';
+                            osc.frequency.value = 880;
+                            gain.gain.setValueAtTime(0.25, ctx.currentTime + offset);
+                            osc.connect(gain).connect(ctx.destination);
+                            osc.start(ctx.currentTime + offset);
+                            osc.stop(ctx.currentTime + offset + 0.3);
+                        }});
                     }}
                 }} catch (e) {{}}
             }})();
@@ -414,6 +619,30 @@ def verificar_alertas(df, ahora):
             """,
             height=0,
         )
+
+
+def mostrar_alertas_pendientes():
+    """Dibuja las alertas guardadas. Sobreviven a los reruns del autorefresco,
+    así que quedan en pantalla hasta que toques 'Entendido'."""
+    pendientes = st.session_state.get("alertas_pendientes", [])
+    if not pendientes:
+        return
+
+    for alerta in list(pendientes):
+        st.error(
+            f"🚨 **¡Tarea próxima! (faltaban {alerta['minutos']} min cuando saltó la alerta)**\n\n"
+            f"📌 **{alerta['titulo']}**  |  📂 {alerta['categoria']}  |  ⏰ {alerta['hora']}"
+        )
+        if st.button("✅ Entendido", key=f"cerrar_alerta_{alerta['id']}"):
+            st.session_state["alertas_pendientes"] = [
+                a for a in st.session_state["alertas_pendientes"] if a["id"] != alerta["id"]
+            ]
+            st.rerun()
+
+    if len(pendientes) > 1:
+        if st.button("✅ Cerrar todas las alertas", key="cerrar_todas_alertas"):
+            st.session_state["alertas_pendientes"] = []
+            st.rerun()
 
 
 def boton_activar_alertas():
@@ -493,8 +722,7 @@ def _hora_por_defecto():
     return (ahora_local() + timedelta(minutes=30)).time()
 
 
-def _hora_fin_por_defecto():
-    return (ahora_local() + timedelta(minutes=60)).time()
+DURACION_POR_DEFECTO = 30
 
 
 def _valores_por_defecto_formulario():
@@ -505,7 +733,7 @@ def _valores_por_defecto_formulario():
         "categoria_input": "ENRESP",
         "fecha_input": ahora_local().date(),
         "hora_input": _hora_por_defecto(),
-        "hora_fin_input": _hora_fin_por_defecto(),
+        "duracion_input": DURACION_POR_DEFECTO,
         "proyecto_input": "Ninguno",
         "ultimo_audio_hash": "",
     }
@@ -556,16 +784,33 @@ if modo_ingreso == "🎙️ Grabar Audio de Voz":
             else:
                 st.sidebar.error(f"⚠️ No se pudo transcribir el audio: {error}")
 
+# La fecha y el horario van FUERA del formulario a propósito: así sus valores
+# se guardan en session_state apenas los tocás y el autorefresco de 20 segundos
+# no puede pisarlos mientras estás cargando la tarea. Además permite mostrar en
+# vivo el rango que va a quedar agendado.
+st.sidebar.markdown("**🗓️ Fecha y horario**")
+fecha = st.sidebar.date_input("Fecha", key="fecha_input")
+col_hi, col_dur = st.sidebar.columns(2)
+with col_hi:
+    hora = st.time_input("Hora de inicio", key="hora_input")
+with col_dur:
+    duracion = st.number_input(
+        "Duración (min)", min_value=5, max_value=600, step=5, key="duracion_input"
+    )
+
+hora_fin, cruza_medianoche = calcular_hora_fin(hora, duracion)
+if cruza_medianoche:
+    st.sidebar.error(
+        "⚠️ Con esa duración la tarea terminaría al día siguiente. "
+        "Bajá la duración para que termine dentro del mismo día."
+    )
+else:
+    st.sidebar.info(f"🕒 Se agenda de **{hora.strftime('%H:%M')}** a **{hora_fin.strftime('%H:%M')}**")
+
 with st.sidebar.form("form_tarea", clear_on_submit=False):
     titulo = st.text_input("Título de la Tarea", key="titulo_input")
     categoria = st.selectbox("Categoría", ["ENRESP", "EXTERNO"], key="categoria_input")
     responsable = st.text_input("Responsable", key="responsable_input")
-    fecha = st.date_input("Fecha", key="fecha_input")
-    col_hi, col_hf = st.columns(2)
-    with col_hi:
-        hora = st.time_input("Hora de inicio", key="hora_input")
-    with col_hf:
-        hora_fin = st.time_input("Hora de fin", key="hora_fin_input")
     proyecto_sel = st.selectbox("Proyecto (opcional)", opciones_proyecto, key="proyecto_input")
     notas = st.text_area("Notas / Minuta inicial", key="notas_input")
 
@@ -574,8 +819,10 @@ with st.sidebar.form("form_tarea", clear_on_submit=False):
     if submitted:
         if titulo.strip() == "":
             st.sidebar.error("⚠️ Debes colocar un título a la tarea.")
-        elif hora_fin <= hora:
-            st.sidebar.error("⚠️ La hora de fin debe ser posterior a la hora de inicio.")
+        elif cruza_medianoche:
+            st.sidebar.error(
+                "⚠️ No se agendó: la tarea terminaría al día siguiente. Bajá la duración."
+            )
         else:
             df_actual = cargar_tareas()
             conflictos = verificar_superposicion(df_actual, fecha, hora, hora_fin)
@@ -598,7 +845,10 @@ with st.sidebar.form("form_tarea", clear_on_submit=False):
                 agregar_tarea(titulo, categoria, responsable, fecha, hora, hora_fin, notas, proyecto_id_nuevo)
 
                 st.toast("🎉 ¡Tarea agregada con éxito!", icon="✅")
-                st.sidebar.success("✅ Tarea registrada en la base de datos.")
+                st.sidebar.success(
+                    f"✅ Agendada el {fecha} de {hora.strftime('%H:%M')} "
+                    f"a {hora_fin.strftime('%H:%M')}."
+                )
 
                 st.session_state["_reset_formulario"] = True
                 time.sleep(1)
@@ -651,7 +901,22 @@ def panel_edicion(tarea_id, df, proyectos_df, ahora):
         nueva_fecha = st.date_input("Fecha", value=fecha_actual, key=f"ed_fecha_{tarea_id}")
         nueva_hora = st.time_input("Hora de inicio", value=hora_actual, key=f"ed_hora_{tarea_id}")
     with col_b:
-        nueva_hora_fin = st.time_input("Hora de fin", value=hora_fin_actual, key=f"ed_horafin_{tarea_id}")
+        nueva_duracion = st.number_input(
+            "Duración (min)",
+            min_value=5,
+            max_value=600,
+            step=5,
+            value=duracion_en_minutos(hora_actual, hora_fin_actual),
+            key=f"ed_duracion_{tarea_id}",
+        )
+
+    nueva_hora_fin, cruza_medianoche_ed = calcular_hora_fin(nueva_hora, nueva_duracion)
+    if cruza_medianoche_ed:
+        st.error("⚠️ Con esa duración la tarea terminaría al día siguiente. Bajá la duración.")
+    else:
+        st.caption(
+            f"🕒 Queda de **{nueva_hora.strftime('%H:%M')}** a **{nueva_hora_fin.strftime('%H:%M')}**"
+        )
 
     pct = st.slider("% Cumplimiento", 0, 100, int(row["avance"]), key=f"ed_pct_{tarea_id}")
     nuevas_notas = st.text_area(
@@ -708,8 +973,8 @@ def panel_edicion(tarea_id, df, proyectos_df, ahora):
     col_g, col_d = st.columns(2)
     with col_g:
         if st.button("💾 Guardar cambios", key=f"ed_guardar_{tarea_id}", use_container_width=True):
-            if nueva_hora_fin <= nueva_hora:
-                st.error("⚠️ La hora de fin debe ser posterior a la hora de inicio.")
+            if cruza_medianoche_ed:
+                st.error("⚠️ No se guardó: con esa duración terminaría al día siguiente.")
             else:
                 df_actual = cargar_tareas()
                 conflictos = verificar_superposicion(
@@ -726,10 +991,11 @@ def panel_edicion(tarea_id, df, proyectos_df, ahora):
                     )
                 else:
                     actualizar_tarea_completa(
-                        tarea_id, pct, nuevas_notas, nueva_fecha, nueva_hora, nueva_hora_fin, proyecto_id_final
+                        tarea_id, pct, nuevas_notas, nueva_fecha, nueva_hora, nueva_hora_fin,
+                        proyecto_id_final, fila_original=row,
                     )
                     for k in (
-                        f"ed_fecha_{tarea_id}", f"ed_hora_{tarea_id}", f"ed_horafin_{tarea_id}",
+                        f"ed_fecha_{tarea_id}", f"ed_hora_{tarea_id}", f"ed_duracion_{tarea_id}",
                         f"ed_pct_{tarea_id}", f"ed_notas_{tarea_id}", f"ed_proy_{tarea_id}",
                     ):
                         st.session_state.pop(k, None)
@@ -737,7 +1003,7 @@ def panel_edicion(tarea_id, df, proyectos_df, ahora):
                     st.rerun()
     with col_d:
         if st.button("🗑️ Eliminar tarea", key=f"ed_eliminar_{tarea_id}", use_container_width=True):
-            eliminar_tarea(tarea_id)
+            eliminar_tarea(tarea_id, row.get("evento_calendar_id"))
             st.rerun()
 
 
@@ -921,12 +1187,24 @@ st.caption(
     "en pantalla funciona siempre, sin necesidad de activarlo."
 )
 
+if CALENDAR_ACTIVO:
+    st.caption(
+        "📅 **Google Calendar conectado.** Cada tarea que agendás también se crea como evento, "
+        "así el aviso de 15 minutos te llega al celular aunque la app esté cerrada."
+    )
+else:
+    st.caption(
+        "📅 Google Calendar **no configurado**. La app funciona igual, pero los avisos en el "
+        "celular solo aparecen con la app abierta en primer plano."
+    )
+
 df = cargar_tareas()
 proyectos_df = cargar_proyectos()
 ahora = ahora_local()
 hoy_str = ahora.strftime("%Y-%m-%d")
 
 verificar_alertas(df, ahora)
+mostrar_alertas_pendientes()
 st.caption(
     f"🔄 Última revisión de alertas: {ahora.strftime('%H:%M:%S')} (hora Argentina) "
     "(se repite sola cada 20 segundos mientras esta pantalla esté abierta)"
