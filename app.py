@@ -374,24 +374,28 @@ def verificar_alertas(df, ahora):
                     tag: 'alerta-tarea-{row["id"]}-{minutos_restantes}',
                     vibrate: [200, 100, 200]
                 }};
-                try {{
-                    if (p.Notification && p.Notification.permission === 'granted') {{
-                        // En Chrome de Android, "new Notification(...)" tira un error
-                        // ("Illegal constructor") y la notificación NUNCA aparece: hay
-                        // que pedirle al Service Worker que la muestre. En PC ambos
-                        // caminos funcionan, así que probamos primero el del Service
-                        // Worker (más compatible) y si no está listo, el clásico.
-                        if (p.navigator && p.navigator.serviceWorker && p.navigator.serviceWorker.ready) {{
-                            p.navigator.serviceWorker.ready.then(function (reg) {{
-                                reg.showNotification(tituloNotif, opcionesNotif);
-                            }}).catch(function (e) {{
-                                try {{ new p.Notification(tituloNotif, opcionesNotif); }} catch (e2) {{}}
-                            }});
-                        }} else {{
-                            new p.Notification(tituloNotif, opcionesNotif);
-                        }}
+                if (p.Notification && p.Notification.permission === 'granted') {{
+                    // En PC (Chrome/Edge/Firefox) el constructor "new Notification(...)"
+                    // funciona directo y al toque, así que lo probamos primero.
+                    try {{
+                        new p.Notification(tituloNotif, opcionesNotif);
+                    }} catch (errConstructor) {{
+                        // En Chrome de Android ese constructor está deshabilitado y tira
+                        // "Illegal constructor" (por eso antes no aparecía nada ahí): en
+                        // ese caso, y SOLO en ese caso, se lo delegamos al Service Worker
+                        // ya registrado. Usamos getRegistration() (responde al toque, sin
+                        // colgarse) en vez de "ready" (que puede quedar esperando para
+                        // siempre si nada lo está controlando, y eso es lo que rompió la
+                        // alerta en PC).
+                        try {{
+                            if (p.navigator && p.navigator.serviceWorker && p.navigator.serviceWorker.getRegistration) {{
+                                p.navigator.serviceWorker.getRegistration().then(function (reg) {{
+                                    if (reg) {{ reg.showNotification(tituloNotif, opcionesNotif); }}
+                                }}).catch(function (e) {{}});
+                            }}
+                        }} catch (e2) {{}}
                     }}
-                }} catch (e) {{}}
+                }}
                 try {{
                     if (p.__appAudioCtx) {{
                         const ctx = p.__appAudioCtx;
@@ -740,8 +744,8 @@ def panel_edicion(tarea_id, df, proyectos_df, ahora):
 # ==========================================
 # TABLA DE UN GRUPO (con selección de fila)
 # ==========================================
-COLUMNAS_TABLA = ["clasificacion", "titulo", "fecha", "hora", "hora_fin", "categoria", "responsable", "avance", "notas"]
-NOMBRES_COLUMNAS = ["Clasificación", "Título", "Fecha", "Hora", "Hasta", "Categoría", "Responsable", "Avance %", "Notas"]
+COLUMNAS_TABLA = ["titulo", "fecha", "hora", "hora_fin", "categoria", "responsable", "avance", "notas", "clasificacion"]
+NOMBRES_COLUMNAS = ["Título", "Fecha", "Hora", "Hasta", "Categoría", "Responsable", "Avance %", "Notas", "Clasificación"]
 
 
 def mostrar_tabla(df_grupo, key, mostrar_columna_proyecto=False):
@@ -754,8 +758,8 @@ def mostrar_tabla(df_grupo, key, mostrar_columna_proyecto=False):
 
     if mostrar_columna_proyecto:
         # Insertamos "Proyecto" justo antes de "Categoria"
-        vista.insert(5, "proyecto_nombre", df_grupo["proyecto_nombre"])
-        nombres = nombres[:5] + ["Proyecto"] + nombres[5:]
+        vista.insert(4, "proyecto_nombre", df_grupo["proyecto_nombre"])
+        nombres = nombres[:4] + ["Proyecto"] + nombres[4:]
 
     vista["📎"] = df_grupo["adjunto_nombre"].apply(lambda x: "📎" if x else "")
     vista.columns = nombres + ["📎"]
