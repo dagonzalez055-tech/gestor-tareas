@@ -226,13 +226,89 @@ def actualizar_evento_calendar(
         return crear_evento_calendar(titulo, notas, fecha, hora, hora_fin, categoria, responsable)
 
 
-def eliminar_evento_calendar(evento_id):
-    if not CALENDAR_ACTIVO or not evento_id:
-        return
+def id_evento_valido(valor):
+    """Devuelve el id como texto, o None si no hay uno real.
+
+    OJO con el NaN de pandas: cuando la columna viene vacía de la base,
+    pandas devuelve NaN (un float), y en Python `not NaN` da False. Por eso
+    un simple `if not evento_id` NO alcanza: dejaba pasar el NaN y la app
+    terminaba pidiéndole a Google que borrara un evento llamado 'nan'."""
+    if valor is None:
+        return None
     try:
-        calendario.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=evento_id).execute()
-    except Exception:
+        if pd.isna(valor):
+            return None
+    except (TypeError, ValueError):
         pass
+    texto = str(valor).strip()
+    return texto if texto and texto.lower() != "nan" else None
+
+
+def buscar_evento_por_tarea(titulo, fecha, hora):
+    """Red de seguridad: busca el evento por título y horario cuando la tarea
+    no tiene guardado el id (por ejemplo, tareas creadas antes de conectar
+    Calendar). Devuelve el id encontrado o None."""
+    if not CALENDAR_ACTIVO:
+        return None
+    try:
+        inicio = _iso_fecha_hora(fecha, hora)
+        desde = f"{inicio}-03:00"
+        hasta_dt = datetime.fromisoformat(inicio) + timedelta(minutes=1)
+        hasta = f"{hasta_dt.isoformat()}-03:00"
+
+        respuesta = (
+            calendario.events()
+            .list(
+                calendarId=GOOGLE_CALENDAR_ID,
+                timeMin=desde,
+                timeMax=hasta,
+                singleEvents=True,
+                maxResults=20,
+            )
+            .execute()
+        )
+        objetivo = str(titulo).strip()
+        for evento in respuesta.get("items", []):
+            resumen = str(evento.get("summary", "")).replace("✅ ", "").strip()
+            if resumen == objetivo:
+                return evento.get("id")
+    except Exception:
+        return None
+    return None
+
+
+def eliminar_evento_calendar(evento_id, titulo=None, fecha=None, hora=None):
+    """Borra el evento del calendario.
+
+    Si no hay id guardado pero sí datos de la tarea, lo busca primero.
+    A diferencia de antes, los errores YA NO se ocultan: si Google rechaza
+    el borrado, te lo dice en pantalla para que lo puedas borrar a mano."""
+    if not CALENDAR_ACTIVO:
+        return
+
+    evento_id = id_evento_valido(evento_id)
+
+    if not evento_id and titulo and fecha and hora:
+        evento_id = buscar_evento_por_tarea(titulo, fecha, hora)
+
+    if not evento_id:
+        # No hay evento asociado: es lo normal en tareas creadas antes de
+        # conectar Calendar. No hay nada que borrar.
+        return
+
+    try:
+        calendario.events().delete(
+            calendarId=GOOGLE_CALENDAR_ID, eventId=evento_id
+        ).execute()
+    except Exception as e:
+        texto = str(e)
+        # 404/410 = el evento ya no existe (lo borraste a mano). No es un error.
+        if "404" in texto or "410" in texto or "Not Found" in texto or "deleted" in texto:
+            return
+        st.warning(
+            "⚠️ La tarea se borró, pero no se pudo borrar el evento en Google "
+            f"Calendar: {e}\n\nBorralo a mano desde Google Calendar."
+        )
 
 
 # Refresca el script solo (sin recargar la pagina) cada 20 segundos, para
@@ -336,9 +412,7 @@ def actualizar_tarea_completa(
     }
 
     if fila_original is not None:
-        evento_previo = fila_original.get("evento_calendar_id")
-        if evento_previo is not None and isinstance(evento_previo, float) and pd.isna(evento_previo):
-            evento_previo = None
+        evento_previo = id_evento_valido(fila_original.get("evento_calendar_id"))
         evento_id = actualizar_evento_calendar(
             evento_previo,
             fila_original["titulo"],
@@ -360,8 +434,18 @@ def marcar_alertado(id_tarea):
     supabase.from_("tareas").update({"alertado": True}).eq("id", id_tarea).execute()
 
 
-def eliminar_tarea(id_tarea, evento_calendar_id=None):
-    eliminar_evento_calendar(evento_calendar_id)
+def eliminar_tarea(id_tarea, fila=None):
+    """Borra la tarea y, si tiene, su evento de Google Calendar.
+
+    Le pasamos la fila entera (no solo el id del evento) para que, si el id
+    no está guardado, se pueda buscar el evento por título y horario."""
+    if fila is not None:
+        eliminar_evento_calendar(
+            fila.get("evento_calendar_id"),
+            titulo=fila.get("titulo"),
+            fecha=fila.get("fecha"),
+            hora=fila.get("hora"),
+        )
     supabase.from_("tareas").delete().eq("id", id_tarea).execute()
 
 
@@ -1003,7 +1087,7 @@ def panel_edicion(tarea_id, df, proyectos_df, ahora):
                     st.rerun()
     with col_d:
         if st.button("🗑️ Eliminar tarea", key=f"ed_eliminar_{tarea_id}", use_container_width=True):
-            eliminar_tarea(tarea_id, row.get("evento_calendar_id"))
+            eliminar_tarea(tarea_id, fila=row)
             st.rerun()
 
 
