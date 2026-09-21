@@ -149,7 +149,7 @@ def _normalizar_columnas_tareas(df):
     """Por si la migración de proyecto_id/adjuntos todavía no se corrió:
     evita que la app se rompa, simplemente esas funciones no van a tener
     efecto hasta que corras el SQL correspondiente."""
-    for col in ("proyecto_id", "adjunto_path", "adjunto_nombre"):
+    for col in ("proyecto_id", "adjunto_path", "adjunto_nombre", "hora_fin"):
         if col not in df.columns:
             df[col] = None
     return df
@@ -171,13 +171,14 @@ def cargar_tareas():
         return pd.DataFrame()
 
 
-def agregar_tarea(titulo, categoria, responsable, fecha, hora, notas, proyecto_id=None):
+def agregar_tarea(titulo, categoria, responsable, fecha, hora, hora_fin, notas, proyecto_id=None):
     data = {
         "titulo": titulo,
         "categoria": categoria,
         "responsable": responsable,
         "fecha": str(fecha),
         "hora": str(hora),
+        "hora_fin": str(hora_fin),
         "estado": "Pendiente",
         "avance": 0,
         "notas": notas,
@@ -187,7 +188,7 @@ def agregar_tarea(titulo, categoria, responsable, fecha, hora, notas, proyecto_i
     supabase.from_("tareas").insert(data).execute()
 
 
-def actualizar_tarea_completa(id_tarea, avance, notas, fecha, hora, proyecto_id=None):
+def actualizar_tarea_completa(id_tarea, avance, notas, fecha, hora, hora_fin, proyecto_id=None):
     estado = "Superado" if avance >= 100 else "Pendiente"
     data = {
         "estado": estado,
@@ -195,6 +196,7 @@ def actualizar_tarea_completa(id_tarea, avance, notas, fecha, hora, proyecto_id=
         "notas": notas,
         "fecha": str(fecha),
         "hora": str(hora),
+        "hora_fin": str(hora_fin),
         "alertado": False,
         "proyecto_id": proyecto_id,
     }
@@ -275,6 +277,16 @@ def _parsear_fecha_hora(fecha, hora):
     return datetime.strptime(f"{fecha} {hora_str}", "%Y-%m-%d %H:%M:%S")
 
 
+def _hora_fin_efectiva(row):
+    """Hora de fin de una tarea. Si es una tarea vieja (cargada antes de que
+    existiera el rango horario) y no tiene hora_fin guardada, se usa la
+    misma hora de inicio (se la trata como instantánea, sin duración)."""
+    valor = row.get("hora_fin")
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return row["hora"]
+    return valor
+
+
 def clasificar_tarea(row, ahora):
     if row["estado"] == "Superado":
         return "Superada"
@@ -283,6 +295,38 @@ def clasificar_tarea(row, ahora):
     except Exception:
         return "Pendiente"
     return "Agendada" if fh >= ahora else "Pendiente"
+
+
+# ==========================================
+# CHOQUE DE HORARIOS (evita agendar dos tareas que se superponen)
+# ==========================================
+def verificar_superposicion(df, fecha, hora_inicio, hora_fin, excluir_id=None):
+    """Devuelve la lista de tareas activas (no Superadas) del mismo día que
+    se solapan con el rango [hora_inicio, hora_fin) que se está por guardar."""
+    if df.empty:
+        return []
+
+    try:
+        ini_nueva = _parsear_fecha_hora(fecha, hora_inicio)
+        fin_nueva = _parsear_fecha_hora(fecha, hora_fin)
+    except Exception:
+        return []
+
+    activas = df[(df["fecha"].astype(str) == str(fecha)) & (df["estado"] != "Superado")]
+    if excluir_id is not None:
+        activas = activas[activas["id"] != excluir_id]
+
+    conflictos = []
+    for _, row in activas.iterrows():
+        try:
+            ini_exist = _parsear_fecha_hora(row["fecha"], row["hora"])
+            fin_exist = _parsear_fecha_hora(row["fecha"], _hora_fin_efectiva(row))
+        except Exception:
+            continue
+        # Dos rangos [a,b) y [c,d) se solapan si a < d y c < b
+        if ini_nueva < fin_exist and ini_exist < fin_nueva:
+            conflictos.append(row)
+    return conflictos
 
 
 # ==========================================
@@ -322,12 +366,30 @@ def verificar_alertas(df, ahora):
             <script>
             (function () {{
                 const p = window.parent;
+                const tituloNotif = '⏰ Tarea en {minutos_restantes} min';
+                const opcionesNotif = {{
+                    body: {titulo_js},
+                    icon: '/app/static/icon-192.png',
+                    badge: '/app/static/icon-192.png',
+                    tag: 'alerta-tarea-{row["id"]}-{minutos_restantes}',
+                    vibrate: [200, 100, 200]
+                }};
                 try {{
                     if (p.Notification && p.Notification.permission === 'granted') {{
-                        new p.Notification('⏰ Tarea en {minutos_restantes} min', {{
-                            body: {titulo_js},
-                            icon: '/app/static/icon-192.png'
-                        }});
+                        // En Chrome de Android, "new Notification(...)" tira un error
+                        // ("Illegal constructor") y la notificación NUNCA aparece: hay
+                        // que pedirle al Service Worker que la muestre. En PC ambos
+                        // caminos funcionan, así que probamos primero el del Service
+                        // Worker (más compatible) y si no está listo, el clásico.
+                        if (p.navigator && p.navigator.serviceWorker && p.navigator.serviceWorker.ready) {{
+                            p.navigator.serviceWorker.ready.then(function (reg) {{
+                                reg.showNotification(tituloNotif, opcionesNotif);
+                            }}).catch(function (e) {{
+                                try {{ new p.Notification(tituloNotif, opcionesNotif); }} catch (e2) {{}}
+                            }});
+                        }} else {{
+                            new p.Notification(tituloNotif, opcionesNotif);
+                        }}
                     }}
                 }} catch (e) {{}}
                 try {{
@@ -427,6 +489,10 @@ def _hora_por_defecto():
     return (ahora_local() + timedelta(minutes=30)).time()
 
 
+def _hora_fin_por_defecto():
+    return (ahora_local() + timedelta(minutes=60)).time()
+
+
 def _valores_por_defecto_formulario():
     return {
         "titulo_input": "",
@@ -435,6 +501,7 @@ def _valores_por_defecto_formulario():
         "categoria_input": "ENRESP",
         "fecha_input": ahora_local().date(),
         "hora_input": _hora_por_defecto(),
+        "hora_fin_input": _hora_fin_por_defecto(),
         "proyecto_input": "Ninguno",
         "ultimo_audio_hash": "",
     }
@@ -490,30 +557,48 @@ with st.sidebar.form("form_tarea", clear_on_submit=False):
     categoria = st.selectbox("Categoría", ["ENRESP", "EXTERNO"], key="categoria_input")
     responsable = st.text_input("Responsable", key="responsable_input")
     fecha = st.date_input("Fecha", key="fecha_input")
-    hora = st.time_input("Hora de inicio", key="hora_input")
+    col_hi, col_hf = st.columns(2)
+    with col_hi:
+        hora = st.time_input("Hora de inicio", key="hora_input")
+    with col_hf:
+        hora_fin = st.time_input("Hora de fin", key="hora_fin_input")
     proyecto_sel = st.selectbox("Proyecto (opcional)", opciones_proyecto, key="proyecto_input")
     notas = st.text_area("Notas / Minuta inicial", key="notas_input")
 
     submitted = st.form_submit_button("➕ Agendar Tarea", use_container_width=True)
 
     if submitted:
-        if titulo.strip() != "":
-            proyecto_id_nuevo = None
-            if proyecto_sel != "Ninguno" and not proyectos_df_sidebar.empty:
-                coincidencia = proyectos_df_sidebar[proyectos_df_sidebar["nombre"] == proyecto_sel]
-                if not coincidencia.empty:
-                    proyecto_id_nuevo = int(coincidencia.iloc[0]["id"])
-
-            agregar_tarea(titulo, categoria, responsable, fecha, hora, notas, proyecto_id_nuevo)
-
-            st.toast("🎉 ¡Tarea agregada con éxito!", icon="✅")
-            st.sidebar.success("✅ Tarea registrada en la base de datos.")
-
-            st.session_state["_reset_formulario"] = True
-            time.sleep(1)
-            st.rerun()
-        else:
+        if titulo.strip() == "":
             st.sidebar.error("⚠️ Debes colocar un título a la tarea.")
+        elif hora_fin <= hora:
+            st.sidebar.error("⚠️ La hora de fin debe ser posterior a la hora de inicio.")
+        else:
+            df_actual = cargar_tareas()
+            conflictos = verificar_superposicion(df_actual, fecha, hora, hora_fin)
+            if conflictos:
+                lista = "\n".join(
+                    f"- **{c['titulo']}** ({str(c['hora'])[:5]} a {str(_hora_fin_efectiva(c))[:5]})"
+                    for c in conflictos
+                )
+                st.sidebar.error(
+                    f"🚫 Ya tenés algo agendado en ese horario el {fecha}:\n\n{lista}\n\n"
+                    "Elegí otro horario libre para poder agendar esta tarea."
+                )
+            else:
+                proyecto_id_nuevo = None
+                if proyecto_sel != "Ninguno" and not proyectos_df_sidebar.empty:
+                    coincidencia = proyectos_df_sidebar[proyectos_df_sidebar["nombre"] == proyecto_sel]
+                    if not coincidencia.empty:
+                        proyecto_id_nuevo = int(coincidencia.iloc[0]["id"])
+
+                agregar_tarea(titulo, categoria, responsable, fecha, hora, hora_fin, notas, proyecto_id_nuevo)
+
+                st.toast("🎉 ¡Tarea agregada con éxito!", icon="✅")
+                st.sidebar.success("✅ Tarea registrada en la base de datos.")
+
+                st.session_state["_reset_formulario"] = True
+                time.sleep(1)
+                st.rerun()
 
 st.sidebar.markdown("---")
 with st.sidebar.expander("🗂️ Crear nuevo proyecto"):
@@ -552,12 +637,17 @@ def panel_edicion(tarea_id, df, proyectos_df, ahora):
         hora_actual = datetime.strptime(str(row["hora"])[:5], "%H:%M").time()
     except Exception:
         hora_actual = ahora.time()
+    try:
+        hora_fin_actual = datetime.strptime(str(_hora_fin_efectiva(row))[:5], "%H:%M").time()
+    except Exception:
+        hora_fin_actual = hora_actual
 
     col_a, col_b = st.columns(2)
     with col_a:
         nueva_fecha = st.date_input("Fecha", value=fecha_actual, key=f"ed_fecha_{tarea_id}")
+        nueva_hora = st.time_input("Hora de inicio", value=hora_actual, key=f"ed_hora_{tarea_id}")
     with col_b:
-        nueva_hora = st.time_input("Hora", value=hora_actual, key=f"ed_hora_{tarea_id}")
+        nueva_hora_fin = st.time_input("Hora de fin", value=hora_fin_actual, key=f"ed_horafin_{tarea_id}")
 
     pct = st.slider("% Cumplimiento", 0, 100, int(row["avance"]), key=f"ed_pct_{tarea_id}")
     nuevas_notas = st.text_area(
@@ -614,14 +704,33 @@ def panel_edicion(tarea_id, df, proyectos_df, ahora):
     col_g, col_d = st.columns(2)
     with col_g:
         if st.button("💾 Guardar cambios", key=f"ed_guardar_{tarea_id}", use_container_width=True):
-            actualizar_tarea_completa(tarea_id, pct, nuevas_notas, nueva_fecha, nueva_hora, proyecto_id_final)
-            for k in (
-                f"ed_fecha_{tarea_id}", f"ed_hora_{tarea_id}", f"ed_pct_{tarea_id}",
-                f"ed_notas_{tarea_id}", f"ed_proy_{tarea_id}",
-            ):
-                st.session_state.pop(k, None)
-            st.toast("Guardado correctamente")
-            st.rerun()
+            if nueva_hora_fin <= nueva_hora:
+                st.error("⚠️ La hora de fin debe ser posterior a la hora de inicio.")
+            else:
+                df_actual = cargar_tareas()
+                conflictos = verificar_superposicion(
+                    df_actual, nueva_fecha, nueva_hora, nueva_hora_fin, excluir_id=tarea_id
+                )
+                if conflictos:
+                    lista = "\n".join(
+                        f"- **{c['titulo']}** ({str(c['hora'])[:5]} a {str(_hora_fin_efectiva(c))[:5]})"
+                        for c in conflictos
+                    )
+                    st.error(
+                        f"🚫 Ese horario se superpone con:\n\n{lista}\n\n"
+                        "Elegí otro horario libre para poder guardar."
+                    )
+                else:
+                    actualizar_tarea_completa(
+                        tarea_id, pct, nuevas_notas, nueva_fecha, nueva_hora, nueva_hora_fin, proyecto_id_final
+                    )
+                    for k in (
+                        f"ed_fecha_{tarea_id}", f"ed_hora_{tarea_id}", f"ed_horafin_{tarea_id}",
+                        f"ed_pct_{tarea_id}", f"ed_notas_{tarea_id}", f"ed_proy_{tarea_id}",
+                    ):
+                        st.session_state.pop(k, None)
+                    st.toast("Guardado correctamente")
+                    st.rerun()
     with col_d:
         if st.button("🗑️ Eliminar tarea", key=f"ed_eliminar_{tarea_id}", use_container_width=True):
             eliminar_tarea(tarea_id)
@@ -631,8 +740,8 @@ def panel_edicion(tarea_id, df, proyectos_df, ahora):
 # ==========================================
 # TABLA DE UN GRUPO (con selección de fila)
 # ==========================================
-COLUMNAS_TABLA = ["clasificacion", "titulo", "fecha", "hora", "categoria", "responsable", "avance", "notas"]
-NOMBRES_COLUMNAS = ["Clasificación", "Título", "Fecha", "Hora", "Categoría", "Responsable", "Avance %", "Notas"]
+COLUMNAS_TABLA = ["clasificacion", "titulo", "fecha", "hora", "hora_fin", "categoria", "responsable", "avance", "notas"]
+NOMBRES_COLUMNAS = ["Clasificación", "Título", "Fecha", "Hora", "Hasta", "Categoría", "Responsable", "Avance %", "Notas"]
 
 
 def mostrar_tabla(df_grupo, key, mostrar_columna_proyecto=False):
@@ -644,9 +753,9 @@ def mostrar_tabla(df_grupo, key, mostrar_columna_proyecto=False):
     nombres = list(NOMBRES_COLUMNAS)
 
     if mostrar_columna_proyecto:
-        # Insertamos "Proyecto" justo despues de "Categoria" (4to lugar)
-        vista.insert(4, "proyecto_nombre", df_grupo["proyecto_nombre"])
-        nombres = nombres[:4] + ["Proyecto"] + nombres[4:]
+        # Insertamos "Proyecto" justo antes de "Categoria"
+        vista.insert(5, "proyecto_nombre", df_grupo["proyecto_nombre"])
+        nombres = nombres[:5] + ["Proyecto"] + nombres[5:]
 
     vista["📎"] = df_grupo["adjunto_nombre"].apply(lambda x: "📎" if x else "")
     vista.columns = nombres + ["📎"]
