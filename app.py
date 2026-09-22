@@ -1265,22 +1265,6 @@ def mostrar_calendario_mes(df, ahora):
 st.title("Planificación de Proyectos")
 
 boton_activar_alertas()
-st.caption(
-    "Tocá el botón de arriba una vez por dispositivo (celular y PC por separado) para "
-    "recibir sonido y notificación cuando falte 15 minutos para una tarea. El cartel rojo "
-    "en pantalla funciona siempre, sin necesidad de activarlo."
-)
-
-if CALENDAR_ACTIVO:
-    st.caption(
-        "📅 **Google Calendar conectado.** Cada tarea que agendás también se crea como evento, "
-        "así el aviso de 15 minutos te llega al celular aunque la app esté cerrada."
-    )
-else:
-    st.caption(
-        "📅 Google Calendar **no configurado**. La app funciona igual, pero los avisos en el "
-        "celular solo aparecen con la app abierta en primer plano."
-    )
 
 df = cargar_tareas()
 proyectos_df = cargar_proyectos()
@@ -1289,11 +1273,6 @@ hoy_str = ahora.strftime("%Y-%m-%d")
 
 verificar_alertas(df, ahora)
 mostrar_alertas_pendientes()
-st.caption(
-    f"🔄 Última revisión de alertas: {ahora.strftime('%H:%M:%S')} (hora Argentina) "
-    "(se repite sola cada 20 segundos mientras esta pantalla esté abierta)"
-)
-st.caption(f"📅 Día actual: **{ahora.strftime('%d/%m/%Y')}**")
 
 id_click = None
 
